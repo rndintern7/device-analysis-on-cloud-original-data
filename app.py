@@ -1,88 +1,105 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import os
 
 # Page Config
-st.set_page_config(page_title="Mtrol PPM Dashboard", layout="wide")
+st.set_page_config(layout="wide", page_title="Mtrol Precision Analytics")
 
-# 1. SIDEBAR CONTROLS
-st.sidebar.header("📊 Control Panel")
+# --- HEADER & LOGO ---
+header_col1, header_col2 = st.columns([4, 1])
+with header_col1:
+    st.title("Mtrol Full-Cycle Analysis")
+    st.write("### Synchronized Original Data (1s Resolution)")
+with header_col2:
+    if os.path.exists("logo.png"):
+        st.image("logo.png", use_container_width=True)
 
-device = st.sidebar.selectbox("Select Device", ["Mtrol 3", "Mtrol 4"])
-param_choice = st.sidebar.selectbox("Select Parameter", 
-                                    ["1: Flow Rate", "2: % Opening", "3: P1", "4: P2"])
-target_temp = st.sidebar.slider("Target Temperature (°C)", -20.0, 70.0, 70.0, 0.5)
-tolerance = st.sidebar.slider("Tolerance (+/- °C)", 0.1, 5.0, 1.0)
+# --- DATA LOADING & SYNC LOGIC ---
+@st.cache_data
+def load_and_sync_data(device_file, temp_file):
+    # 1. Load Device Data (starts 10:20:53 or 10:21:05)
+    df_dev = pd.read_csv(device_file)
+    df_dev['Time Stamp'] = pd.to_datetime(df_dev['Time Stamp'])
+    
+    # 2. Load Chamber Temp (starts 10:20, every 2 mins)
+    df_temp = pd.read_csv(temp_file).dropna(subset=['Timestamp'])
+    df_temp['Timestamp'] = pd.to_datetime(df_temp['Timestamp'])
+    
+    # 3. Synchronize
+    df_dev = df_dev.set_index('Time Stamp').sort_index()
+    df_temp = df_temp.set_index('Timestamp').sort_index()
+    
+    # Merge and interpolate the 2-minute temperature gaps into 1-second steps
+    combined = pd.concat([df_dev, df_temp], axis=1)
+    combined['Temperature (°C)(Temp)'] = combined['Temperature (°C)(Temp)'].interpolate(method='time')
+    
+    # Filter back to only the device timeframe
+    combined = combined.loc[df_dev.index[0] : df_dev.index[-1]]
+    return combined.reset_index().rename(columns={'index': 'Full_Time'})
 
-# 2. COLOR PALETTE (8 Colors)
-color_palette = {
-    'Mtrol 3': {'1: Flow Rate': '#1f77b4', '2: % Opening': '#2ca02c', '3: P1': '#ff7f0e', '4: P2': '#9467bd'},
-    'Mtrol 4': {'1: Flow Rate': '#d62728', '2: % Opening': '#17becf', '3: P1': '#bcbd22', '4: P2': '#e377c2'}
+# --- FILENAMES ---
+files = {
+    "Mtrol 3": "Mtrol 3 11-13 march - Mtrol 3 original data.csv",
+    "Mtrol 4": "Mtrol 4 11-13 march - Mtrol 4 original_data .csv",
+    "Chamber": "Mtrol 3 and 4 11-13 march - Chamber temp data.csv"
 }
 
-# 3. LOAD DATA
-@st.cache_data # This makes the website fast
-def load_data(dev):
-    if dev == "Mtrol 3":
-        file = 'Mtrol_3_11-13_March_2min_Average - Mtrol_3_11-13_March_2min_Average.csv.csv'
-    else:
-        file = 'Mtrol_4_11-13_March_2min_Average - Mtrol_4_11-13_March_2min_Average.csv.csv'
-    df = pd.read_csv(file)
-    df['Time Stamp'] = pd.to_datetime(df['Time Stamp'])
-    return df
+# --- SIDEBAR CONTROLS ---
+st.sidebar.header("Settings")
+device_mode = st.sidebar.radio("Choose Device", ["Mtrol 3", "Mtrol 4"])
+selected_param = st.sidebar.selectbox("Select Parameter", ["P1", "P2", "Flow Rate", "% Opening"])
 
-try:
-    df = load_data(device)
-    param_map = {'1: Flow Rate': 'Flow Rate', '2: % Opening': '% Opening', '3: P1': 'P1', '4: P2': 'P2'}
-    col = param_map[param_choice]
+if all(os.path.exists(f) for f in [files[device_mode], files["Chamber"]]):
+    df = load_and_sync_data(files[device_mode], files["Chamber"])
+    
+    # --- DYNAMIC SCALING LOGIC ---
+    param_l = selected_param.lower()
+    if "flow" in param_l:
+        l_range, l_dtick = [0, 320], 40
+    elif "p1" in param_l or "p2" in param_l:
+        l_range, l_dtick = [0, 20], 2
+    else: # % Opening and others
+        l_range, l_dtick = [-20, 70], 10
 
-    # Filter Logic
-    mask = (df['Chamber Temperature (°C)'] >= target_temp - tolerance) & \
-           (df['Chamber Temperature (°C)'] <= target_temp + tolerance)
-    df_fixed = df[mask].copy()
+    # --- GRAPHING ---
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-    if not df_fixed.empty:
-        # PPM Calculation
-        mean_val = df_fixed[col].mean()
-        df_fixed['PPM'] = ((df_fixed[col] - mean_val) / mean_val) * 1_000_000
+    # Left Y-Axis: Device Parameter
+    fig.add_trace(go.Scattergl(
+        x=df['Full_Time'], y=df[selected_param],
+        name=f"{device_mode} {selected_param}",
+        line=dict(color="#00CCFF", width=1.5)
+    ), secondary_y=False)
 
-        # 4. PLOTLY GRAPH
-        fig = go.Figure()
-        selected_color = color_palette[device][param_choice]
-        
-        # Main Trace
-        fig.add_trace(go.Scatter(
-            x=df_fixed['Time Stamp'], y=df_fixed['PPM'],
-            mode='lines+markers',
-            line=dict(color=selected_color, width=3),
-            name=f"ACTIVE: {device} {col}"
-        ))
+    # Right Y-Axis: Interpolated Chamber Temp
+    fig.add_trace(go.Scattergl(
+        x=df['Full_Time'], y=df['Temperature (°C)(Temp)'],
+        name="Chamber Temp (Sync)",
+        line=dict(color="#FFD700", dash='dot', width=2)
+    ), secondary_y=True)
 
-        # Add Legend Reference Traces
-        for d in ['Mtrol 3', 'Mtrol 4']:
-            for p, color in color_palette[d].items():
-                fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers',
-                                         marker=dict(color=color, size=10),
-                                         name=f"{d} {p.split(': ')[1]}"))
+    fig.update_layout(
+        template="plotly_dark", height=700,
+        hovermode="x unified",
+        dragmode="zoom",
+        xaxis=dict(
+            title="Time Progress (1s Res)",
+            rangeslider=dict(visible=True),
+            showspikes=True, spikemode="across"
+        ),
+        yaxis=dict(title=f"<b>{selected_param}</b>", range=l_range, dtick=l_dtick, fixedrange=False),
+        yaxis2=dict(title="<b>Chamber Temp (°C)</b>", range=[-20, 70], dtick=10, fixedrange=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
+    )
 
-        fig.update_layout(
-            title=f"<b>{device} Stability: {col}</b> (Temp: {target_temp}°C ±{tolerance})",
-            xaxis=dict(title="Time Stamp", rangeslider=dict(visible=True)),
-            yaxis=dict(title="PPM Deviation"),
-            legend=dict(title="Color Key", yanchor="top", y=1, xanchor="left", x=1.02),
-            height=700, template="plotly_white"
-        )
+    st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
+    
+    # Show Raw Data
+    st.subheader("Synchronized Data Explorer")
+    st.write(f"Displaying rows for {device_mode} start time onwards.")
+    st.dataframe(df, use_container_width=True)
 
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # 5. STATS SUMMARY
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Average Value", f"{mean_val:.4f}")
-        col2.metric("Max PPM", f"{df_fixed['PPM'].max():.2f}")
-        col3.metric("Min PPM", f"{df_fixed['PPM'].min():.2f}")
-
-    else:
-        st.warning(f"No data found for {target_temp}°C within ±{tolerance}°C tolerance.")
-
-except FileNotFoundError:
-    st.error("CSV files not found. Please ensure they are in the same folder as app.py")
+else:
+    st.error("One or more files missing in GitHub. Check filenames.")
